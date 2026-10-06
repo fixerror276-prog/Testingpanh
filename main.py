@@ -1,7 +1,6 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
-import requests
 from bs4 import BeautifulSoup
 import re
 from typing import Optional, List, Dict, Any
@@ -11,6 +10,7 @@ import asyncio
 import aiohttp
 import os
 from urllib.parse import quote_plus
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="Free PAN to GSTIN Lookup API",
@@ -45,24 +45,20 @@ class PANDetailsResponse(BaseModel):
     aadhaar_linked: Optional[bool] = None
     date_of_birth: Optional[str] = None
     father_name: Optional[str] = None
-    
-    # GSTIN Information
+
     gstin_details: List[GSTINInfo] = []
     gstin_count: int = 0
-    
-    # Business Information
+
     business_nature: Optional[str] = None
     constitution: Optional[str] = None
-    
-    # Contact Information
+
     address: Optional[str] = None
     state: Optional[str] = None
     pincode: Optional[str] = None
-    
-    # Source Information
+
     sources_checked: List[str] = []
     search_mode: Optional[str] = None
-    
+
     error: Optional[str] = None
     message: Optional[str] = None
     timestamp: str
@@ -136,10 +132,9 @@ async def batch_lookup(pans: List[str], background_tasks: BackgroundTasks):
     """Batch lookup for multiple PANs (async processing)"""
     if len(pans) > 5:
         raise HTTPException(status_code=400, detail="Maximum 5 PANs per batch")
-    
+
     valid_pans = [p.upper() for p in pans if len(p) == 10]
-    
-    # Process in background
+
     results = []
     for pan in valid_pans:
         try:
@@ -152,7 +147,7 @@ async def batch_lookup(pans: List[str], background_tasks: BackgroundTasks):
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             })
-    
+
     return {
         "batch_id": f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         "total_pans": len(pans),
@@ -163,63 +158,64 @@ async def batch_lookup(pans: List[str], background_tasks: BackgroundTasks):
 
 async def process_pan_lookup(pan: str, mode: str = "fast") -> PANDetailsResponse:
     """Core PAN lookup logic using public sources"""
-    
-    # Validate PAN format
+
     if not re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', pan):
         raise HTTPException(status_code=400, detail="Invalid PAN format. Must be like ABCDE1234F")
-    
+
     sources_checked = []
     gstin_results = []
     pan_details = {}
-    
+
     try:
         # Determine which sources to check based on mode
+        # NOTE: pass function references (not calls) — session & pan are passed later
         if mode == "fast":
-            tasks = [search_gst_suvidha(pan), search_pan_details(pan)]
+            tasks = [search_gst_suvidha, search_pan_details]
         elif mode == "deep":
             tasks = [
-                search_gst_suvidha(pan),
-                search_gst_portal(pan),
-                search_pan_details(pan),
-                search_mca_portal(pan)
+                search_gst_suvidha,
+                search_gst_portal,
+                search_pan_details,
+                search_mca_portal
             ]
         else:  # comprehensive
             tasks = [
-                search_gst_suvidha(pan),
-                search_gst_portal(pan),
-                search_pan_details(pan),
-                search_mca_portal(pan),
-                search_udyam_portal(pan)
+                search_gst_suvidha,
+                search_gst_portal,
+                search_pan_details,
+                search_mca_portal,
+                search_udyam_portal
             ]
-        
+
         # Execute all searches concurrently
         async with aiohttp.ClientSession() as session:
-            results = await asyncio.gather(*[task(session, pan) for task in tasks], return_exceptions=True)
-        
+            results = await asyncio.gather(
+                *[task(session, pan) for task in tasks],
+                return_exceptions=True
+            )
+
         # Process results
-        for i, result in enumerate(results):
+        for result in results:
             if isinstance(result, Exception):
                 continue
-            
+
             if result and "source" in result:
                 sources_checked.append(result["source"])
-                
+
                 if "gstin_details" in result:
                     gstin_results.extend(result["gstin_details"])
-                
+
                 if "pan_details" in result:
                     pan_details.update(result["pan_details"])
-        
+
         # Deduplicate GSTIN results
         unique_gstins = {}
         for gstin in gstin_results:
             if gstin.gstin and gstin.gstin not in unique_gstins:
                 unique_gstins[gstin.gstin] = gstin
-        
-        # Extract PAN category from PAN number
+
         pan_category = determine_pan_category(pan)
-        
-        # Prepare response
+
         return PANDetailsResponse(
             success=True,
             pan_number=pan,
@@ -231,24 +227,26 @@ async def process_pan_lookup(pan: str, mode: str = "fast") -> PANDetailsResponse
             aadhaar_linked=pan_details.get("aadhaar_linked"),
             date_of_birth=pan_details.get("date_of_birth"),
             father_name=pan_details.get("father_name"),
-            
+
             gstin_details=list(unique_gstins.values()),
             gstin_count=len(unique_gstins),
-            
+
             business_nature=pan_details.get("business_nature"),
             constitution=pan_details.get("constitution"),
-            
+
             address=pan_details.get("address"),
             state=pan_details.get("state"),
             pincode=pan_details.get("pincode"),
-            
+
             sources_checked=sources_checked,
             search_mode=mode,
-            
+
             message="PAN lookup completed",
             timestamp=datetime.now().isoformat()
         )
-    
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lookup failed: {str(e)}")
 
@@ -263,143 +261,101 @@ async def search_gst_suvidha(session: aiohttp.ClientSession, pan: str) -> Dict[s
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5"
         }
-        
-        async with session.get(url, headers=headers, timeout=10) as response:
+
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
             html = await response.text()
             soup = BeautifulSoup(html, 'html.parser')
-            
+
             gstin_details = []
-            
-            # Look for GSTIN in the page (common patterns)
+
             gstin_pattern = r'\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}'
             matches = re.findall(gstin_pattern, html)
-            
-            for match in matches[:5]:  # Limit to 5 GSTINs
+
+            for match in matches[:5]:
                 gstin_details.append(GSTINInfo(
                     gstin=match,
                     source="gst_suvidha",
                     last_updated=datetime.now().strftime("%Y-%m-%d")
                 ))
-            
-            # Try to extract business name
+
             business_name = None
-            name_elements = soup.find_all(['h1', 'h2', 'h3', 'div', 'span'], 
-                                         class_=re.compile(r'business|name|company|title', re.I))
-            
+            name_elements = soup.find_all(
+                ['h1', 'h2', 'h3', 'div', 'span'],
+                class_=re.compile(r'business|name|company|title', re.I)
+            )
+
             for elem in name_elements:
                 text = elem.get_text(strip=True)
-                if len(text) > 5 and len(text) < 100:
+                if 5 < len(text) < 100:
                     business_name = text
                     break
-            
+
             return {
                 "source": "gst_suvidha",
                 "gstin_details": gstin_details,
-                "pan_details": {
-                    "name": business_name
-                }
+                "pan_details": {"name": business_name}
             }
-    
+
     except Exception:
         return {"source": "gst_suvidha", "error": "Failed to fetch"}
 
 async def search_gst_portal(session: aiohttp.ClientSession, pan: str) -> Dict[str, Any]:
-    """Search official GST portal"""
+    """Search official GST portal (placeholder – CAPTCHA protected)"""
     try:
-        # This is a simulated search - actual portal may require CAPTCHA
-        url = "https://services.gst.gov.in/services/searchtp"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://services.gst.gov.in/services/searchtp"
-        }
-        
-        # Note: Actual GST portal requires CAPTCHA and session handling
-        # This is a placeholder implementation
-        
         return {
             "source": "gst_portal",
             "gstin_details": [],
-            "pan_details": {
-                "note": "GST portal requires CAPTCHA for direct access"
-            }
+            "pan_details": {"note": "GST portal requires CAPTCHA for direct access"}
         }
-    
     except Exception:
         return {"source": "gst_portal", "error": "Access restricted"}
 
 async def search_pan_details(session: aiohttp.ClientSession, pan: str) -> Dict[str, Any]:
     """Search PAN details from public sources"""
     try:
-        # Use Income Tax portal patterns
-        url = f"https://www.incometaxindia.gov.in/Pages/utilities/Know-Your-PAN.aspx"
-        
+        url = "https://www.incometaxindia.gov.in/Pages/utilities/Know-Your-PAN.aspx"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        
-        async with session.get(url, headers=headers, timeout=10) as response:
+
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
             html = await response.text()
-            
-            # Extract PAN holder name pattern (common in IT portal)
+
             name_pattern = r'Name[:\s]*([A-Z\s\.]+)'
             name_match = re.search(name_pattern, html, re.IGNORECASE)
-            
+
             pan_details = {}
             if name_match:
                 pan_details["name"] = name_match.group(1).strip()
-            
-            # Determine PAN category from 4th character
-            pan_category = determine_pan_category(pan)
-            pan_details["type"] = pan_category
-            
+
+            pan_details["type"] = determine_pan_category(pan)
+
             return {
                 "source": "pan_portal",
                 "pan_details": pan_details
             }
-    
+
     except Exception:
         return {"source": "pan_portal", "error": "Failed to fetch"}
 
 async def search_mca_portal(session: aiohttp.ClientSession, pan: str) -> Dict[str, Any]:
     """Search MCA (Ministry of Corporate Affairs) portal"""
     try:
-        url = f"https://www.mca.gov.in/mcafoportal/showCompanyMasterData.do"
-        
-        # For companies, PAN might be CIN or associated
-        # This is a simplified version
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        # Note: MCA portal requires specific parameters
         return {
             "source": "mca_portal",
-            "pan_details": {
-                "note": "MCA lookup requires company CIN/LLPIN"
-            }
+            "pan_details": {"note": "MCA lookup requires company CIN/LLPIN"}
         }
-    
     except Exception:
         return {"source": "mca_portal", "error": "Failed to fetch"}
 
 async def search_udyam_portal(session: aiohttp.ClientSession, pan: str) -> Dict[str, Any]:
     """Search Udyam registration portal"""
     try:
-        url = f"https://udyamregistration.gov.in/Udyam_Verify.aspx"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        # Udyam portal might have MSME registration by PAN
         return {
             "source": "udyam_portal",
-            "pan_details": {
-                "note": "Udyam portal lookup available"
-            }
+            "pan_details": {"note": "Udyam portal lookup available"}
         }
-    
     except Exception:
         return {"source": "udyam_portal", "error": "Failed to fetch"}
 
@@ -407,7 +363,7 @@ def determine_pan_category(pan: str) -> str:
     """Determine PAN holder category from PAN number"""
     if len(pan) < 4:
         return "Unknown"
-    
+
     fourth_char = pan[3]
     categories = {
         'A': 'Association of Persons (AOP)',
@@ -422,22 +378,18 @@ def determine_pan_category(pan: str) -> str:
         'T': 'Trust',
         'E': 'Estates'
     }
-    
+
     return categories.get(fourth_char, 'Individual/Other')
 
-# Health check endpoint
 @app.get("/api/health")
 async def health_check():
     """API health check"""
     try:
-        # Test a sample PAN lookup (async)
-        test_pan = "AAAAA1234A"
         test_url = "https://gst-suvidha.com"
-        
         async with aiohttp.ClientSession() as session:
-            async with session.get(test_url, timeout=5) as response:
+            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
                 gst_suvidha_up = response.status == 200
-        
+
         return {
             "status": "healthy",
             "service": "Free PAN to GSTIN Lookup API",
@@ -455,8 +407,6 @@ async def health_check():
         }
 
 # CORS middleware
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -465,14 +415,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache for recent lookups (in-memory, simple)
-lookup_cache = {}
-
 @app.middleware("http")
 async def add_cache_control(request, call_next):
     """Add cache control headers"""
     response = await call_next(request)
-    response.headers["Cache-Control"] = "public, max-age=300"  # 5 minutes cache
+    response.headers["Cache-Control"] = "public, max-age=300"
     response.headers["X-API-Version"] = "1.0.0"
     return response
 
